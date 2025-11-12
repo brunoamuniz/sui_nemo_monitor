@@ -205,3 +205,14 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Telegram session files
+*.session
+user_session*.session
+
+# Cache directory
+cache/
+
+# Log files
+*.log
+sui_monitor.log
