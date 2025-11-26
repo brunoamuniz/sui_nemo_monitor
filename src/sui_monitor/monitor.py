@@ -12,7 +12,14 @@ from .config import load_config
 from .cache import CacheManager
 from .telegram import TelegramNotifier
 from .detector import ChangeDetector
-from .utils import format_timestamp, extract_transaction_value, check_large_transfer
+from .utils import (
+    format_timestamp, 
+    extract_transaction_value, 
+    check_large_transfer,
+    extract_package_changes,
+    extract_created_objects,
+    is_package_transaction
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +42,10 @@ class SuiProtocolMonitor:
 
         # Connect to Telegram on initialization
         self._initialize_telegram()
+        
+        # Check last package on startup if account monitoring is enabled
+        if self.config.get("account_monitoring", {}).get("enabled", False):
+            self._check_last_package_on_startup()
 
     def _initialize_telegram(self):
         """Initialize Telegram and send startup message"""
@@ -101,6 +112,242 @@ class SuiProtocolMonitor:
         except Exception as e:
             logger.error(f"Error fetching transactions for {package_id}: {e}")
             return []
+
+    def get_account_transactions(self, account_address: str, limit: int = 50) -> List[Dict]:
+        """Fetch recent transactions from a specific account address"""
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "suix_queryTransactionBlocks",
+                "params": [
+                    {
+                        "filter": {
+                            "FromAddress": account_address
+                        },
+                        "options": {
+                            "showInput": True,
+                            "showEffects": True,
+                            "showEvents": True,
+                            "showObjectChanges": True,
+                            "showBalanceChanges": True
+                        }
+                    },
+                    None,  # cursor
+                    limit,
+                    True   # descending order
+                ]
+            }
+
+            response = self.session.post(
+                self.config["sui_rpc_url"],
+                json=payload,
+                timeout=30
+            )
+            response.raise_for_status()
+
+            result = response.json()
+            if "result" in result:
+                return result["result"]["data"]
+            else:
+                logger.error(f"Error in RPC response: {result}")
+                return []
+
+        except Exception as e:
+            logger.error(f"Error fetching transactions for account {account_address}: {e}")
+            return []
+
+    def _check_last_package_on_startup(self):
+        """Check if last reported package is in cache, if not, notify again"""
+        account_config = self.config.get("account_monitoring", {})
+        account_address = account_config.get("address", "")
+        
+        if not account_address:
+            logger.info("Account monitoring enabled but no address configured")
+            return
+        
+        try:
+            logger.info(f"Checking last package for account {account_address[:20]}... on startup")
+            last_package = self.cache_manager.get_last_package(account_address)
+            
+            if last_package:
+                package_id = last_package.get("package_id", "")
+                logger.info(f"Found last reported package: {package_id[:20]}...")
+                
+                # Check if this package is still in the cached packages list
+                cached_packages = self.cache_manager.get_cached_packages(account_address)
+                logger.info(f"Found {len(cached_packages)} packages in cache")
+                
+                # Check if package is in cache
+                package_in_cache = any(
+                    pkg.get("package_id", "") == package_id 
+                    for pkg in cached_packages
+                )
+                
+                if not package_in_cache:
+                    # Package not in cache, send notification again
+                    logger.info(f"⚠️ Last reported package {package_id[:20]}... not in cache, sending notification again")
+                    self._send_package_notification(last_package, account_address)
+                    # Save back to cache
+                    if last_package not in cached_packages:
+                        cached_packages.append(last_package)
+                        self.cache_manager.save_packages(account_address, cached_packages)
+                        logger.info(f"Last package saved back to cache")
+                else:
+                    logger.info(f"✅ Last reported package {package_id[:20]}... is in cache")
+            else:
+                logger.info("No last package found in cache (first run or cache cleared)")
+        except Exception as e:
+            logger.error(f"Error checking last package on startup: {e}", exc_info=True)
+
+    def _send_package_notification(self, package_info: Dict, account_address: str):
+        """Send notification about package publish/upgrade"""
+        package_type = package_info.get("type", "")
+        package_id = package_info.get("package_id", "")
+        timestamp = format_timestamp(package_info.get("timestamp", 0))
+        tx_hash = package_info.get("transaction_digest", "")
+        
+        if package_type == "published":
+            message = f"📦 **NEW PACKAGE PUBLISHED**\n\n"
+            message += f"**Account:** `{account_address[:20]}...`\n"
+            message += f"**Package ID:** `{package_id[:20]}...`\n"
+            message += f"**Version:** {package_info.get('version', 'N/A')}\n"
+            message += f"**Time:** {timestamp}\n"
+            message += f"**Transaction:** `{tx_hash[:20]}...`"
+        elif package_type == "upgraded":
+            message = f"🔄 **PACKAGE UPGRADED**\n\n"
+            message += f"**Account:** `{account_address[:20]}...`\n"
+            message += f"**Package ID:** `{package_id[:20]}...`\n"
+            prev_version = package_info.get("previous_version", "N/A")
+            version = package_info.get("version", "N/A")
+            message += f"**Version:** {prev_version} → {version}\n"
+            message += f"**Time:** {timestamp}\n"
+            message += f"**Transaction:** `{tx_hash[:20]}...`"
+        else:
+            return
+        
+        self.telegram_notifier.send_alert(message, "NEW_ACTIVITY")
+
+    def _send_object_notification(self, object_info: Dict, account_address: str):
+        """Send notification about new object created"""
+        obj_id = object_info.get("object_id", "")
+        object_type = object_info.get("object_type", "")
+        timestamp = format_timestamp(object_info.get("timestamp", 0))
+        tx_hash = object_info.get("transaction_digest", "")
+        
+        message = f"🆕 **NEW OBJECT CREATED**\n\n"
+        message += f"**Account:** `{account_address[:20]}...`\n"
+        message += f"**Object ID:** `{obj_id[:20]}...`\n"
+        message += f"**Type:** {object_type}\n"
+        message += f"**Time:** {timestamp}\n"
+        message += f"**Transaction:** `{tx_hash[:20]}...`"
+        
+        self.telegram_notifier.send_alert(message, "NEW_ACTIVITY")
+
+    def monitor_account(self, account_address: str) -> Dict:
+        """Monitor account for package and object changes"""
+        logger.info(f"Monitoring account: {account_address}")
+        
+        # Get account monitoring config
+        account_config = self.config.get("account_monitoring", {})
+        limit = account_config.get("max_transactions_per_check", 50)
+        
+        # Fetch recent transactions from account
+        current_transactions = self.get_account_transactions(account_address, limit)
+        
+        if not current_transactions:
+            logger.warning(f"No transactions found for account {account_address}")
+            return {
+                "packages_published": 0,
+                "packages_upgraded": 0,
+                "objects_created": 0,
+                "has_changes": False
+            }
+        
+        logger.info(f"Found {len(current_transactions)} transactions for account {account_address}")
+        
+        # Get cached packages and objects
+        cached_packages = self.cache_manager.get_cached_packages(account_address)
+        cached_objects = self.cache_manager.get_cached_objects(account_address)
+        
+        # Track changes
+        new_packages = []
+        upgraded_packages = []
+        new_objects = []
+        
+        # Process transactions to find package and object changes
+        for tx in current_transactions:
+            # Check for package changes
+            package_change = extract_package_changes(tx, account_address)
+            if package_change:
+                package_id = package_change.get("package_id", "")
+                tx_digest = package_change.get("transaction_digest", "")
+                
+                # Check if this package is already in cache
+                package_in_cache = any(
+                    pkg.get("package_id", "") == package_id and 
+                    pkg.get("transaction_digest", "") == tx_digest
+                    for pkg in cached_packages
+                )
+                
+                if not package_in_cache:
+                    if package_change.get("type") == "published":
+                        new_packages.append(package_change)
+                        logger.info(f"New package published: {package_id}")
+                    elif package_change.get("type") == "upgraded":
+                        upgraded_packages.append(package_change)
+                        logger.info(f"Package upgraded: {package_id}")
+                    
+                    # Add to cache
+                    cached_packages.append(package_change)
+                    # Save as last package
+                    self.cache_manager.save_last_package(account_address, package_change)
+            
+            # Check for new objects created
+            created_objects = extract_created_objects(tx, account_address)
+            for obj_info in created_objects:
+                obj_id = obj_info.get("object_id", "")
+                tx_digest = obj_info.get("transaction_digest", "")
+                
+                # Check if this object is already in cache
+                object_in_cache = any(
+                    obj.get("object_id", "") == obj_id and
+                    obj.get("transaction_digest", "") == tx_digest
+                    for obj in cached_objects
+                )
+                
+                if not object_in_cache:
+                    new_objects.append(obj_info)
+                    logger.info(f"New object created: {obj_id}")
+                    cached_objects.append(obj_info)
+        
+        # Save updated cache
+        if new_packages or upgraded_packages:
+            self.cache_manager.save_packages(account_address, cached_packages)
+        if new_objects:
+            self.cache_manager.save_objects(account_address, cached_objects)
+        
+        # Send notifications
+        for package in new_packages:
+            self._send_package_notification(package, account_address)
+        
+        for package in upgraded_packages:
+            self._send_package_notification(package, account_address)
+        
+        for obj_info in new_objects:
+            self._send_object_notification(obj_info, account_address)
+        
+        # Update last check time
+        self.cache_manager.save_last_check_time_account(account_address, datetime.now())
+        
+        has_changes = len(new_packages) > 0 or len(upgraded_packages) > 0 or len(new_objects) > 0
+        
+        return {
+            "packages_published": len(new_packages),
+            "packages_upgraded": len(upgraded_packages),
+            "objects_created": len(new_objects),
+            "has_changes": has_changes
+        }
 
     def analyze_transaction(self, tx: Dict) -> Dict:
         """Analyze a transaction and extract relevant information"""
@@ -405,6 +652,27 @@ class SuiProtocolMonitor:
 
             except Exception as e:
                 logger.error(f"Error monitoring {protocol_name}: {e}")
+
+        # Monitor account if enabled
+        account_config = self.config.get("account_monitoring", {})
+        if account_config.get("enabled", False):
+            try:
+                account_address = account_config.get("address", "")
+                if account_address:
+                    account_result = self.monitor_account(account_address)
+                    
+                    if account_result["has_changes"]:
+                        changes_detected += 1
+                        logger.info(
+                            f"Account monitoring results: "
+                            f"{account_result['packages_published']} packages published, "
+                            f"{account_result['packages_upgraded']} packages upgraded, "
+                            f"{account_result['objects_created']} objects created"
+                        )
+                    else:
+                        logger.info("No changes detected for monitored account")
+            except Exception as e:
+                logger.error(f"Error monitoring account: {e}")
 
         logger.info(
             f"Monitoring cycle completed - {protocols_checked} protocols checked, {changes_detected} with changes")

@@ -3,7 +3,7 @@ Utility functions for SUI Monitor
 """
 
 from datetime import datetime
-from typing import Dict
+from typing import Dict, List, Optional
 
 
 def format_timestamp(timestamp_ms) -> str:
@@ -92,4 +92,134 @@ def check_large_transfer(tx: Dict) -> Dict:
                     large_transfers["BTC"] = btc_amount
 
     return large_transfers
+
+
+def extract_package_changes(tx: Dict, account_address: str) -> Optional[Dict]:
+    """Extract package publish/upgrade information from transaction if from monitored account"""
+    # Check if transaction is from the monitored account
+    tx_sender = tx.get("transaction", {}).get("data", {}).get("sender", "")
+    if tx_sender.lower() != account_address.lower():
+        return None
+    
+    # Check transaction kind - package publish/upgrade transactions
+    tx_kind = tx.get("transaction", {}).get("data", {}).get("transaction", {})
+    tx_kind_name = list(tx_kind.keys())[0] if tx_kind else ""
+    
+    # Check object changes for published or upgraded packages
+    object_changes = tx.get("objectChanges", [])
+    
+    # First, check for published packages
+    for obj_change in object_changes:
+        change_type = obj_change.get("type", "")
+        
+        if change_type == "published":
+            # New package published
+            package_id = obj_change.get("packageId", "")
+            version = obj_change.get("version", "")
+            
+            return {
+                "type": "published",
+                "package_id": package_id,
+                "version": version,
+                "transaction_digest": tx.get("digest", ""),
+                "timestamp": tx.get("timestampMs", 0),
+                "sender": tx_sender
+            }
+    
+    # Check for package upgrades
+    # Upgrades can be detected by:
+    # 1. Transaction kind is "upgrade" or "publish" (for upgrade)
+    # 2. Object changes with type "mutated" and objectType containing "package"
+    if tx_kind_name == "upgrade" or (tx_kind_name == "publish" and "upgrade" in str(tx_kind).lower()):
+        for obj_change in object_changes:
+            change_type = obj_change.get("type", "")
+            object_type = obj_change.get("objectType", "")
+            
+            if change_type == "mutated" and "package" in object_type.lower():
+                package_id = obj_change.get("objectId", "")
+                version = obj_change.get("version", "")
+                previous_version = obj_change.get("previousVersion", "")
+                
+                return {
+                    "type": "upgraded",
+                    "package_id": package_id,
+                    "version": version,
+                    "previous_version": previous_version,
+                    "transaction_digest": tx.get("digest", ""),
+                    "timestamp": tx.get("timestampMs", 0),
+                    "sender": tx_sender
+                }
+    
+    # Also check for mutated packages (alternative way upgrades might appear)
+    for obj_change in object_changes:
+        change_type = obj_change.get("type", "")
+        object_type = obj_change.get("objectType", "")
+        
+        if change_type == "mutated" and "package" in object_type.lower():
+            # Check if version changed (indicates upgrade)
+            version = obj_change.get("version", "")
+            previous_version = obj_change.get("previousVersion", "")
+            
+            if previous_version and version and previous_version != version:
+                package_id = obj_change.get("objectId", "")
+                
+                return {
+                    "type": "upgraded",
+                    "package_id": package_id,
+                    "version": version,
+                    "previous_version": previous_version,
+                    "transaction_digest": tx.get("digest", ""),
+                    "timestamp": tx.get("timestampMs", 0),
+                    "sender": tx_sender
+                }
+    
+    return None
+
+
+def extract_created_objects(tx: Dict, account_address: str) -> List[Dict]:
+    """Extract objects created by the monitored account from transaction"""
+    created_objects = []
+    
+    # Check if transaction is from the monitored account
+    tx_sender = tx.get("transaction", {}).get("data", {}).get("sender", "")
+    if tx_sender.lower() != account_address.lower():
+        return created_objects
+    
+    # Check object changes for created objects
+    object_changes = tx.get("objectChanges", [])
+    
+    for obj_change in object_changes:
+        if obj_change.get("type") == "created":
+            obj_id = obj_change.get("objectId", "")
+            object_type = obj_change.get("objectType", "")
+            version = obj_change.get("version", "")
+            
+            # Skip package objects (handled separately)
+            if "package" not in object_type.lower():
+                created_objects.append({
+                    "object_id": obj_id,
+                    "object_type": object_type,
+                    "version": version,
+                    "transaction_digest": tx.get("digest", ""),
+                    "timestamp": tx.get("timestampMs", 0),
+                    "sender": tx_sender
+                })
+    
+    return created_objects
+
+
+def is_package_transaction(tx: Dict) -> bool:
+    """Check if transaction is related to package publish or upgrade"""
+    object_changes = tx.get("objectChanges", [])
+    
+    for obj_change in object_changes:
+        change_type = obj_change.get("type", "")
+        if change_type == "published":
+            return True
+        elif change_type == "mutated":
+            object_type = obj_change.get("objectType", "")
+            if "package" in object_type.lower():
+                return True
+    
+    return False
 
