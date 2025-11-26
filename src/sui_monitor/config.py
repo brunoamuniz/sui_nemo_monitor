@@ -41,9 +41,25 @@ def load_config() -> Dict:
         "alert_threshold_usd": scallop_threshold
     }
     
+    # Account monitoring configuration
+    account_monitoring_enabled = os.getenv("ACCOUNT_MONITORING_ENABLED", "true").lower() == "true"
+    account_monitoring_address = os.getenv("MONITORED_ACCOUNT_ADDRESS", "").strip()
+    
+    # Validate account monitoring configuration
+    if account_monitoring_enabled and not account_monitoring_address:
+        logger.warning("ACCOUNT_MONITORING_ENABLED is true but MONITORED_ACCOUNT_ADDRESS is not set. Disabling account monitoring.")
+        account_monitoring_enabled = False
+    
+    account_monitoring = {
+        "enabled": account_monitoring_enabled,
+        "address": account_monitoring_address,
+        "max_transactions_per_check": int(os.getenv("ACCOUNT_MAX_TRANSACTIONS_PER_CHECK", "50"))
+    }
+    
     config = {
         "sui_rpc_url": os.getenv("SUI_RPC_URL", "https://fullnode.mainnet.sui.io:443"),
         "protocols": protocols,
+        "account_monitoring": account_monitoring,
         "monitoring": {
             "check_interval_minutes": int(os.getenv("CHECK_INTERVAL_MINUTES", "5")),
             "large_transfer_threshold_usd": float(os.getenv("LARGE_TRANSFER_THRESHOLD_USD", "10000")),
